@@ -1,443 +1,670 @@
 # Accelerator for pip, the Python package manager.
 #
-# Author: Peter Odding <peter.odding@paylogic.eu>
-# Last Change: February 18, 2014
+# Author: Peter Odding <peter.odding@paylogic.com>
+# Last Change: November 14, 2015
 # URL: https://github.com/paylogic/pip-accel
 #
 # TODO Permanently store logs in the pip-accel directory (think about log rotation).
 # TODO Maybe we should save the output of `python setup.py bdist_dumb` somewhere as well?
 
 """
-The Python module :py:mod:`pip_accel` defines the classes and functions that
-implement the functionality of the pip accelerator and the ``pip-accel``
-command. Instead of using the ``pip-accel`` command you can also use the pip
-accelerator as a Python module. In this case you'll probably want to start by
-taking a look at the following functions:
+Top level functionality of `pip-accel`.
 
-- :py:func:`unpack_source_dists`
-- :py:func:`download_source_dists`
-- :py:func:`install_requirements`
+The Python module :mod:`pip_accel` defines the classes that implement the
+top level functionality of the pip accelerator. Instead of using the
+``pip-accel`` command you can also use the pip accelerator as a Python module,
+in this case you'll probably want to start by taking a look at
+the :class:`PipAccelerator` class.
+
+Wheel support
+-------------
+
+During the upgrade to pip 6 support for installation of wheels_ was added to
+pip-accel. The ``pip-accel`` command line program now downloads and installs
+wheels when available for a given requirement, but part of pip-accel's Python
+API defaults to the more conservative choice of allowing callers to opt-in to
+wheel support.
+
+This is because previous versions of pip-accel would only download source
+distributions and pip-accel provides the functionality to convert those source
+distributions to "dumb binary distributions". This functionality is exposed to
+callers who may depend on this mode of operation. So for now users of the
+Python API get to decide whether they're interested in wheels or not.
+
+Setuptools upgrade
+~~~~~~~~~~~~~~~~~~
+
+If the requirement set includes wheels and ``setuptools >= 0.8`` is not yet
+installed, it will be added to the requirement set and installed together with
+the other requirement(s) in order to enable the usage of distributions
+installed from wheels (their metadata is different).
+
+.. _wheels: https://pypi.python.org/pypi/wheel
 """
 
-# Semi-standard module versioning.
-__version__ = '0.11.7'
-
 # Standard library modules.
+import logging
 import os
 import os.path
-import pipes
 import shutil
 import sys
 import tempfile
-import textwrap
-import urllib
-import urlparse
 
 # Modules included in our package.
-from pip_accel.bdist import get_binary_dist, install_binary_dist
-from pip_accel.config import (binary_index, download_cache,
-                              index_version_file, source_index)
+from pip_accel.bdist import BinaryDistributionManager
+from pip_accel.compat import basestring
+from pip_accel.exceptions import EnvironmentMismatchError, NothingToDoError
 from pip_accel.req import Requirement
-from pip_accel.logger import logger
+from pip_accel.utils import (
+    create_file_url,
+    hash_files,
+    is_installed,
+    makedirs,
+    match_option,
+    match_option_with_value,
+    same_directories,
+    uninstall,
+)
 
 # External dependencies.
-import coloredlogs
-from humanfriendly import Timer
+from humanfriendly import concatenate, Timer, pluralize
 from pip import index as pip_index_module
-from pip import parseopts
-from pip.cmdoptions import requirements as requirements_option
+from pip import wheel as pip_wheel_module
+from pip._vendor import pkg_resources
 from pip.commands import install as pip_install_module
 from pip.commands.install import InstallCommand
-from pip.exceptions import DistributionNotFound, InstallationError
-from pip.log import logger as pip_logger
-from pip.status_codes import SUCCESS
+from pip.exceptions import DistributionNotFound
 
-# Find the environment where requirements are to be installed.
-ENVIRONMENT = os.path.abspath(os.environ.get('VIRTUAL_ENV', sys.prefix))
+# Semi-standard module versioning.
+__version__ = '0.37'
 
-# The main loop of pip-accel retries at most this many times to counter pip errors
-# due to connectivity issues with PyPI and/or linked distribution websites.
-MAX_RETRIES = 10
+# Initialize a logger for this module.
+logger = logging.getLogger(__name__)
 
-# The version number of the binary distribution cache format in use. When we
-# break backwards compatibility we bump this number so that pip-accel knows it
-# should clear the cache before proceeding.
-CACHE_FORMAT_REVISION = 4
 
-def main():
+class PipAccelerator(object):
+
     """
-    Main logic of the ``pip-accel`` command.
+    Accelerator for pip, the Python package manager.
+
+    The :class:`PipAccelerator` class brings together the top level logic of
+    pip-accel. This top level logic was previously just a collection of
+    functions but that became more unwieldy as the amount of internal state
+    increased. The :class:`PipAccelerator` class is intended to make it
+    (relatively) easy to build something on top of pip and pip-accel.
     """
-    arguments = sys.argv[1:]
-    # If no arguments are given, the help text of pip-accel is printed.
-    if not arguments:
-        print_usage()
-        sys.exit(0)
-    # If no install subcommand is given we pass the command line straight
-    # to pip without any changes and exit immediately afterwards.
-    elif 'install' not in arguments:
-        sys.exit(os.spawnvp(os.P_WAIT, 'pip', ['pip'] + arguments))
-    # Initialize logging output.
-    coloredlogs.install()
-    # Increase verbosity based on -v, --verbose options.
-    for argument in arguments:
-        if argument == '--verbose' or (len(argument) >= 2 and argument[0] ==
-                '-' and argument[1] != '-' and 'v' in argument):
-            coloredlogs.increase_verbosity()
-    # Make sure the prefix is the same as the environment.
-    if not os.path.samefile(sys.prefix, ENVIRONMENT):
-        logger.error("You are trying to install packages in environment #1 which is different from environment #2 where pip-accel is installed! Please install pip-accel under environment #1 to install packages there.")
-        logger.info("Environment #1: %s ($VIRTUAL_ENV)", ENVIRONMENT)
-        logger.info("Environment #2: %s (installation prefix)", sys.prefix)
-        sys.exit(1)
-    main_timer = Timer()
-    initialize_directories()
-    build_directory = tempfile.mkdtemp()
-    # Execute "pip install" in a loop in order to retry after intermittent
-    # error responses from servers (which can happen quite frequently).
-    try:
-        for i in xrange(1, MAX_RETRIES):
-            try:
-                requirements = unpack_source_dists(arguments, build_directory)
-            except DistributionNotFound:
-                logger.warn("We don't have all source distributions yet!")
-                download_source_dists(arguments, build_directory)
+
+    def __init__(self, config, validate=True):
+        """
+        Initialize the pip accelerator.
+
+        :param config: The pip-accel configuration (a :class:`.Config`
+                       object).
+        :param validate: :data:`True` to run :func:`validate_environment()`,
+                         :data:`False` otherwise.
+        """
+        self.config = config
+        self.bdists = BinaryDistributionManager(self.config)
+        if validate:
+            self.validate_environment()
+        self.initialize_directories()
+        self.clean_source_index()
+        # Keep a list of build directories created by pip-accel.
+        self.build_directories = []
+        # We hold on to returned Requirement objects so we can remove their
+        # temporary sources after pip-accel has finished.
+        self.reported_requirements = []
+
+    def validate_environment(self):
+        """
+        Make sure :data:`sys.prefix` matches ``$VIRTUAL_ENV`` (if defined).
+
+        This may seem like a strange requirement to dictate but it avoids hairy
+        issues like `documented here <https://github.com/paylogic/pip-accel/issues/5>`_.
+
+        The most sneaky thing is that ``pip`` doesn't have this problem
+        (de-facto) because ``virtualenv`` copies ``pip`` wherever it goes...
+        (``pip-accel`` on the other hand has to be installed by the user).
+        """
+        environment = os.environ.get('VIRTUAL_ENV')
+        if environment:
+            if not same_directories(sys.prefix, environment):
+                raise EnvironmentMismatchError("""
+                    You are trying to install packages in environment #1 which
+                    is different from environment #2 where pip-accel is
+                    installed! Please install pip-accel under environment #1 to
+                    install packages there.
+
+                    Environment #1: {environment} (defined by $VIRTUAL_ENV)
+
+                    Environment #2: {prefix} (Python's installation prefix)
+                """, environment=environment, prefix=sys.prefix)
+
+    def initialize_directories(self):
+        """Automatically create the local source distribution index directory."""
+        makedirs(self.config.source_index)
+
+    def clean_source_index(self):
+        """
+        Cleanup broken symbolic links in the local source distribution index.
+
+        The purpose of this method requires some context to understand. Let me
+        preface this by stating that I realize I'm probably overcomplicating
+        things, but I like to preserve forward / backward compatibility when
+        possible and I don't feel like dropping everyone's locally cached
+        source distribution archives without a good reason to do so. With that
+        out of the way:
+
+        - Versions of pip-accel based on pip 1.4.x maintained a local source
+          distribution index based on a directory containing symbolic links
+          pointing directly into pip's download cache. When files were removed
+          from pip's download cache, broken symbolic links remained in
+          pip-accel's local source distribution index directory. This resulted
+          in very confusing error messages. To avoid this
+          :func:`clean_source_index()` cleaned up broken symbolic links
+          whenever pip-accel was about to invoke pip.
+
+        - More recent versions of pip (6.x) no longer support the same style of
+          download cache that contains source distribution archives that can be
+          re-used directly by pip-accel. To cope with the changes in pip 6.x
+          new versions of pip-accel tell pip to download source distribution
+          archives directly into the local source distribution index directory
+          maintained by pip-accel.
+
+        - It is very reasonable for users of pip-accel to have multiple
+          versions of pip-accel installed on their system (imagine a dozen
+          Python virtual environments that won't all be updated at the same
+          time; this is the situation I always find myself in :-). These
+          versions of pip-accel will be sharing the same local source
+          distribution index directory.
+
+        - All of this leads up to the local source distribution index directory
+          containing a mixture of symbolic links and regular files with no
+          obvious way to atomically and gracefully upgrade the local source
+          distribution index directory while avoiding fights between old and
+          new versions of pip-accel :-).
+
+        - I could of course switch to storing the new local source distribution
+          index in a differently named directory (avoiding potential conflicts
+          between multiple versions of pip-accel) but then I would have to
+          introduce a new configuration option, otherwise everyone who has
+          configured pip-accel to store its source index in a non-default
+          location could still be bitten by compatibility issues.
+
+        For now I've decided to keep using the same directory for the local
+        source distribution index and to keep cleaning up broken symbolic
+        links. This enables cooperating between old and new versions of
+        pip-accel and avoids trashing user's local source distribution indexes.
+        The main disadvantage is that pip-accel is still required to clean up
+        broken symbolic links...
+        """
+        cleanup_timer = Timer()
+        cleanup_counter = 0
+        for entry in os.listdir(self.config.source_index):
+            pathname = os.path.join(self.config.source_index, entry)
+            if os.path.islink(pathname) and not os.path.exists(pathname):
+                logger.warn("Cleaning up broken symbolic link: %s", pathname)
+                os.unlink(pathname)
+                cleanup_counter += 1
+        logger.debug("Cleaned up %i broken symbolic links from source index in %s.", cleanup_counter, cleanup_timer)
+
+    def install_from_arguments(self, arguments, **kw):
+        """
+        Download, unpack, build and install the specified requirements.
+
+        This function is a simple wrapper for :func:`get_requirements()`,
+        :func:`install_requirements()` and :func:`cleanup_temporary_directories()`
+        that implements the default behavior of the pip accelerator. If you're
+        extending or embedding pip-accel you may want to call the underlying
+        methods instead.
+
+        If the requirement set includes wheels and ``setuptools >= 0.8`` is not
+        yet installed, it will be added to the requirement set and installed
+        together with the other requirement(s) in order to enable the usage of
+        distributions installed from wheels (their metadata is different).
+
+        :param arguments: The command line arguments to ``pip install ..`` (a
+                          list of strings).
+        :param kw: Any keyword arguments are passed on to
+                   :func:`install_requirements()`.
+        :returns: The result of :func:`install_requirements()`.
+        """
+        try:
+            requirements = self.get_requirements(arguments, use_wheels=self.arguments_allow_wheels(arguments))
+            have_wheels = any(req.is_wheel for req in requirements)
+            if have_wheels and not self.setuptools_supports_wheels():
+                logger.info("Preparing to upgrade to setuptools >= 0.8 to enable wheel support ..")
+                requirements.extend(self.get_requirements(['setuptools >= 0.8']))
+            if requirements:
+                return self.install_requirements(requirements, **kw)
             else:
-                install_requirements(requirements)
-                logger.info("Done! Took %s to install %i package%s.", main_timer, len(requirements), '' if len(requirements) == 1 else 's')
-                return
-            logger.warn("pip failed, retrying (%i/%i) ..", i + 1, MAX_RETRIES)
-    except InstallationError:
-        # Abort early when pip reports installation errors.
-        logger.fatal("pip reported unrecoverable installation errors. Please fix and rerun!")
-        sys.exit(1)
-    finally:
-        # Always cleanup temporary build directory.
-        shutil.rmtree(build_directory)
-    # Abort when after N retries we still failed to download source distributions.
-    logger.fatal("External command failed %i times, aborting!" % MAX_RETRIES)
-    sys.exit(1)
+                logger.info("Nothing to do! (requirements already installed)")
+                return 0
+        finally:
+            self.cleanup_temporary_directories()
 
-def print_usage():
-    """
-    Report the usage of the pip-accel command to the console.
-    """
-    print textwrap.dedent("""
-        Usage: pip-accel [ARGUMENTS TO PIP]
+    def setuptools_supports_wheels(self):
+        """
+        Check whether setuptools should be upgraded to ``>= 0.8`` for wheel support.
 
-        The pip-accel program is a wrapper for pip, the Python package manager. It
-        accelerates the usage of pip to initialize Python virtual environments given
-        one or more requirements files. The pip-accel command supports all subcommands
-        and options supported by pip, however it is only useful for the "pip install"
-        subcommand.
+        :returns: :data:`True` when setuptools needs to be upgraded, :data:`False` otherwise.
+        """
+        # Don't use pkg_resources.Requirement.parse, to avoid the override
+        # in distribute, that converts `setuptools' to `distribute'.
+        setuptools_requirement = next(pkg_resources.parse_requirements('setuptools >= 0.8'))
+        try:
+            installed_setuptools = pkg_resources.get_distribution('setuptools')
+            if installed_setuptools in setuptools_requirement:
+                # setuptools >= 0.8 is already installed; nothing to do.
+                return True
+        except pkg_resources.DistributionNotFound:
+            pass
+        # We need to install setuptools >= 0.8.
+        return False
 
-        For more information please refer to the GitHub project page
-        at https://github.com/paylogic/pip-accel
-    """).strip()
+    def get_requirements(self, arguments, max_retries=None, use_wheels=False):
+        """
+        Use pip to download and unpack the requested source distribution archives.
 
-def clear_build_directory(directory):
-    """
-    Since pip 1.4 there is a new exception that's raised by pip:
-    ``PreviousBuildDirError``. Unfortunately pip-accel apparently triggers the
-    worst possible side effect of this new "feature" and the only way to avoid
-    it is to start with an empty build directory in every step of pip-accel's
-    process (possibly very inefficient).
+        :param arguments: The command line arguments to ``pip install ...`` (a
+                          list of strings).
+        :param max_retries: The maximum number of times that pip will be asked
+                            to download distribution archives (this helps to
+                            deal with intermittent failures). If this is
+                            :data:`None` then :attr:`~.Config.max_retries` is
+                            used.
+        :param use_wheels: Whether pip and pip-accel are allowed to use wheels_
+                           (:data:`False` by default for backwards compatibility
+                           with callers that use pip-accel as a Python API).
 
-    :param directory: The build directory to clear.
-    """
-    logger.debug("Clearing build directory ..")
-    if os.path.isdir(directory):
-        shutil.rmtree(directory)
-    os.makedirs(directory)
+        .. warning:: Requirements which are already installed are not included
+                     in the result. If this breaks your use case consider using
+                     pip's ``--ignore-installed`` option.
+        """
+        arguments = self.decorate_arguments(arguments)
+        with DownloadLogFilter():
+            # Use a new build directory for each run of get_requirements().
+            self.create_build_directory()
+            # Check whether -U or --upgrade was given.
+            if any(match_option(a, '-U', '--upgrade') for a in arguments):
+                logger.info("Checking index(es) for new version (-U or --upgrade was given) ..")
+            else:
+                # If -U or --upgrade wasn't given and all requirements can be
+                # satisfied using the archives in pip-accel's local source
+                # index we don't need pip to connect to PyPI looking for new
+                # versions (that will just slow us down).
+                try:
+                    return self.unpack_source_dists(arguments, use_wheels=use_wheels)
+                except DistributionNotFound:
+                    logger.info("We don't have all distribution archives yet!")
+            # Get the maximum number of retries from the configuration if the
+            # caller didn't specify a preference.
+            if max_retries is None:
+                max_retries = self.config.max_retries
+            # If not all requirements are available locally we use pip to
+            # download the missing source distribution archives from PyPI (we
+            # retry a couple of times in case pip reports recoverable
+            # errors).
+            for i in range(max_retries):
+                try:
+                    return self.download_source_dists(arguments, use_wheels=use_wheels)
+                except Exception as e:
+                    if i + 1 < max_retries:
+                        # On all but the last iteration we swallow exceptions
+                        # during downloading.
+                        logger.warning("pip raised exception while downloading distributions: %s", e)
+                    else:
+                        # On the last iteration we don't swallow exceptions
+                        # during downloading because the error reported by pip
+                        # is the most sensible error for us to report.
+                        raise
+                logger.info("Retrying after pip failed (%i/%i) ..", i + 1, max_retries)
 
-def unpack_source_dists(arguments, build_directory):
-    """
-    Check whether there are local source distributions available for all
-    requirements, unpack the source distribution archives and find the names
-    and versions of the requirements. By using the ``pip install --no-install``
-    command we avoid reimplementing the following pip features:
+    def decorate_arguments(self, arguments):
+        """
+        Change pathnames of local files into ``file://`` URLs with ``#md5=...`` fragments.
 
-    - Parsing of ``requirements.txt`` (including recursive parsing)
-    - Resolution of possibly conflicting pinned requirements
-    - Unpacking source distributions in multiple formats
-    - Finding the name & version of a given source distribution
+        :param arguments: The command line arguments to ``pip install ...`` (a
+                          list of strings).
+        :returns: A copy of the command line arguments with pathnames of local
+                  files rewritten to ``file://`` URLs.
 
-    :param arguments: A list of strings with the command line arguments to be
-                      passed to the ``pip`` command.
+        When pip-accel calls pip to download missing distribution archives and
+        the user specified the pathname of a local distribution archive on the
+        command line, pip will (by default) *not* copy the archive into the
+        download directory if an archive for the same package name and
+        version is already present.
 
-    :returns: A list of :py:class:`pip_accel.req.Requirement` objects. If
-              ``pip`` fails, an exception will be raised by ``pip``.
-    """
-    unpack_timer = Timer()
-    logger.info("Unpacking local source distributions ..")
-    clear_build_directory(build_directory)
-    try:
-        install_custom_package_finder()
-        # Execute pip to unpack the source distributions.
-        requirement_set = run_pip(arguments + ['--no-install'],
-                                  use_remote_index=False,
-                                  build_directory=build_directory)
-        logger.info("Unpacked local source distributions in %s.", unpack_timer)
-        # XXX This feels (looks) like a nasty hack but it prevents an unhandled
-        # exception that was introduced in pip-accel==0.11. Please refer to
-        # https://github.com/paylogic/pip-accel/issues/24 for gory details.
+        This can lead to the confusing situation where the user specifies a
+        local distribution archive to install, a different (older) archive for
+        the same package and version is present in the download directory and
+        `pip-accel` installs the older archive instead of the newer archive.
+
+        To avoid this confusing behavior, the :func:`decorate_arguments()`
+        method rewrites the command line arguments given to ``pip install`` so
+        that pathnames of local archives are changed into ``file://`` URLs that
+        include a fragment with the hash of the file's contents. Here's an
+        example:
+
+        - Local pathname: ``/tmp/pep8-1.6.3a0.tar.gz``
+        - File URL: ``file:///tmp/pep8-1.6.3a0.tar.gz#md5=19cbf0b633498ead63fb3c66e5f1caf6``
+
+        When pip fills the download directory and encounters a previously
+        cached distribution archive it will check the hash, realize the
+        contents have changed and replace the archive in the download
+        directory.
+        """
+        arguments = list(arguments)
+        for i, value in enumerate(arguments):
+            is_constraint_file = (i >= 1 and match_option(arguments[i - 1], '-c', '--constraint'))
+            is_requirement_file = (i >= 1 and match_option(arguments[i - 1], '-r', '--requirement'))
+            if not is_constraint_file and not is_requirement_file and os.path.isfile(value):
+                arguments[i] = '%s#md5=%s' % (create_file_url(value), hash_files('md5', value))
+        return arguments
+
+    def unpack_source_dists(self, arguments, use_wheels=False):
+        """
+        Find and unpack local source distributions and discover their metadata.
+
+        :param arguments: The command line arguments to ``pip install ...`` (a
+                          list of strings).
+        :param use_wheels: Whether pip and pip-accel are allowed to use wheels_
+                           (:data:`False` by default for backwards compatibility
+                           with callers that use pip-accel as a Python API).
+        :returns: A list of :class:`pip_accel.req.Requirement` objects.
+        :raises: Any exceptions raised by pip, for example
+                 :exc:`pip.exceptions.DistributionNotFound` when not all
+                 requirements can be satisfied.
+
+        This function checks whether there are local source distributions
+        available for all requirements, unpacks the source distribution
+        archives and finds the names and versions of the requirements. By using
+        the ``pip install --download`` command we avoid reimplementing the
+        following pip features:
+
+        - Parsing of ``requirements.txt`` (including recursive parsing).
+        - Resolution of possibly conflicting pinned requirements.
+        - Unpacking source distributions in multiple formats.
+        - Finding the name & version of a given source distribution.
+        """
+        unpack_timer = Timer()
+        logger.info("Unpacking distribution(s) ..")
+        with PatchedAttribute(pip_install_module, 'PackageFinder', CustomPackageFinder):
+            requirements = self.get_pip_requirement_set(arguments, use_remote_index=False, use_wheels=use_wheels)
+            logger.info("Finished unpacking %s in %s.", pluralize(len(requirements), "distribution"), unpack_timer)
+            return requirements
+
+    def download_source_dists(self, arguments, use_wheels=False):
+        """
+        Download missing source distributions.
+
+        :param arguments: The command line arguments to ``pip install ...`` (a
+                          list of strings).
+        :param use_wheels: Whether pip and pip-accel are allowed to use wheels_
+                           (:data:`False` by default for backwards compatibility
+                           with callers that use pip-accel as a Python API).
+        :raises: Any exceptions raised by pip.
+        """
+        download_timer = Timer()
+        logger.info("Downloading missing distribution(s) ..")
+        requirements = self.get_pip_requirement_set(arguments, use_remote_index=True, use_wheels=use_wheels)
+        logger.info("Finished downloading distribution(s) in %s.", download_timer)
+        return requirements
+
+    def get_pip_requirement_set(self, arguments, use_remote_index, use_wheels=False):
+        """
+        Get the unpacked requirement(s) specified by the caller by running pip.
+
+        :param arguments: The command line arguments to ``pip install ...`` (a
+                          list of strings).
+        :param use_remote_index: A boolean indicating whether pip is allowed to
+                                 connect to the main package index
+                                 (http://pypi.python.org by default).
+        :param use_wheels: Whether pip and pip-accel are allowed to use wheels_
+                           (:data:`False` by default for backwards compatibility
+                           with callers that use pip-accel as a Python API).
+        :returns: A :class:`pip.req.RequirementSet` object created by pip.
+        :raises: Any exceptions raised by pip.
+        """
+        # Compose the pip command line arguments. This is where a lot of the
+        # core logic of pip-accel is hidden and it uses some esoteric features
+        # of pip so this method is heavily commented.
+        command_line = []
+        # Use `--download' to instruct pip to download requirement(s) into
+        # pip-accel's local source distribution index directory. This has the
+        # following documented side effects (see `pip install --help'):
+        #  1. It disables the installation of requirements (without using the
+        #     `--no-install' option which is deprecated and slated for removal
+        #     in pip 7.x).
+        #  2. It ignores requirements that are already installed (because
+        #     pip-accel doesn't actually need to re-install requirements that
+        #     are already installed we will have work around this later, but
+        #     that seems fairly simple to do).
+        command_line.append('--download=%s' % self.config.source_index)
+        # Use `--find-links' to point pip at pip-accel's local source
+        # distribution index directory. This ensures that source distribution
+        # archives are never downloaded more than once (regardless of the HTTP
+        # cache that was introduced in pip 6.x).
+        command_line.append('--find-links=%s' % create_file_url(self.config.source_index))
+        # Use `--no-binary=:all:' to ignore wheel distributions by default in
+        # order to preserve backwards compatibility with callers that expect a
+        # requirement set consisting only of source distributions that can be
+        # converted to `dumb binary distributions'.
+        if not use_wheels and self.arguments_allow_wheels(arguments):
+            command_line.append('--no-binary=:all:')
+        # Use `--no-index' to force pip to only consider source distribution
+        # archives contained in pip-accel's local source distribution index
+        # directory. This enables pip-accel to ask pip "Can the local source
+        # distribution index satisfy all requirements in the given requirement
+        # set?" which enables pip-accel to keep pip off the internet unless
+        # absolutely necessary :-).
+        if not use_remote_index:
+            command_line.append('--no-index')
+        # Use `--no-clean' to instruct pip to unpack the source distribution
+        # archives and *not* clean up the unpacked source distributions
+        # afterwards. This enables pip-accel to replace pip's installation
+        # logic with cached binary distribution archives.
+        command_line.append('--no-clean')
+        # Use `--build-directory' to instruct pip to unpack the source
+        # distribution archives to a temporary directory managed by pip-accel.
+        # We will clean up the build directory when we're done using the
+        # unpacked source distributions.
+        command_line.append('--build-directory=%s' % self.build_directory)
+        # Append the user's `pip install ...' arguments to the command line
+        # that we just assembled.
+        command_line.extend(arguments)
+        logger.info("Executing command: pip install %s", ' '.join(command_line))
+        # Clear the build directory to prevent PreviousBuildDirError exceptions.
+        self.clear_build_directory()
+        # During the pip 6.x upgrade pip-accel switched to using `pip install
+        # --download' which can produce an interactive prompt as described in
+        # issue 51 [1]. The documented way [2] to get rid of this interactive
+        # prompt is pip's --exists-action option, but due to what is most
+        # likely a bug in pip this doesn't actually work. The environment
+        # variable $PIP_EXISTS_ACTION does work however, so if the user didn't
+        # set it we will set a reasonable default for them.
+        # [1] https://github.com/paylogic/pip-accel/issues/51
+        # [2] https://pip.pypa.io/en/latest/reference/pip.html#exists-action-option
+        os.environ.setdefault('PIP_EXISTS_ACTION', 'w')
+        # Initialize and run the `pip install' command.
+        command = InstallCommand()
+        opts, args = command.parse_args(command_line)
+        if not opts.ignore_installed:
+            # If the user didn't supply the -I, --ignore-installed option we
+            # will forcefully disable the option. Refer to the documentation of
+            # the AttributeOverrides class for further details.
+            opts = AttributeOverrides(opts, ignore_installed=False)
+        requirement_set = command.run(opts, args)
+        # Make sure the output of pip and pip-accel are not intermingled.
+        sys.stdout.flush()
+        if requirement_set is None:
+            raise NothingToDoError("""
+                pip didn't generate a requirement set, most likely you
+                specified an empty requirements file?
+            """)
+        else:
+            return self.transform_pip_requirement_set(requirement_set)
+
+    def transform_pip_requirement_set(self, requirement_set):
+        """
+        Transform pip's requirement set into one that `pip-accel` can work with.
+
+        :param requirement_set: The :class:`pip.req.RequirementSet` object
+                                reported by pip.
+        :returns: A list of :class:`pip_accel.req.Requirement` objects.
+
+        This function converts the :class:`pip.req.RequirementSet` object
+        reported by pip into a list of :class:`pip_accel.req.Requirement`
+        objects.
+        """
         filtered_requirements = []
         for requirement in requirement_set.requirements.values():
-            if requirement.satisfied_by:
-                logger.info("Requirement already satisfied: %s.", requirement)
-            else:
+            # The `satisfied_by' property is set by pip when a requirement is
+            # already satisfied (i.e. a version of the package that satisfies
+            # the requirement is already installed) and -I, --ignore-installed
+            # is not used. We filter out these requirements because pip never
+            # unpacks distributions for these requirements, so pip-accel can't
+            # do anything useful with such requirements.
+            if not requirement.satisfied_by:
                 filtered_requirements.append(requirement)
-        return sorted([Requirement(r) for r in filtered_requirements],
+                self.reported_requirements.append(requirement)
+        return sorted([Requirement(self.config, r) for r in filtered_requirements],
                       key=lambda r: r.name.lower())
-    finally:
-        cleanup_custom_package_finder()
 
-def download_source_dists(arguments, build_directory):
-    """
-    Download missing source distributions.
-
-    :param arguments: A list with the arguments intended for ``pip``.
-    """
-    download_timer = Timer()
-    logger.info("Downloading source distributions ..")
-    clear_build_directory(build_directory)
-    # Execute pip to download missing source distributions.
-    try:
-        run_pip(arguments + ['--no-install'], use_remote_index=True, build_directory=build_directory)
-        logger.info("Finished downloading source distributions in %s.", download_timer)
-    except Exception, e:
-        logger.warn("pip raised an exception while downloading source distributions: %s.", e)
-
-def install_requirements(requirements, install_prefix=ENVIRONMENT):
-    """
-    Manually install all requirements from binary distributions.
-
-    :param requirements: A list of :py:class:`pip_accel.req.Requirement` objects.
-    :param install_prefix: The "prefix" under which the requirements should be
-                           installed. This will be a pathname like ``/usr``,
-                           ``/usr/local`` or the pathname of a virtual
-                           environment.
-    :returns: ``True`` if it succeeds in installing all requirements from
-              binary distribution archives, ``False`` otherwise.
-    """
-    install_timer = Timer()
-    logger.info("Installing from binary distributions ..")
-    python = os.path.join(install_prefix, 'bin', 'python')
-    pip = os.path.join(install_prefix, 'bin', 'pip')
-    for requirement in requirements:
-        if os.system('%s uninstall --yes %s >/dev/null 2>&1' % (pipes.quote(pip), pipes.quote(requirement.name))) == 0:
-            logger.info("Uninstalled previously installed package %s.", requirement.name)
-        members = get_binary_dist(requirement.name, requirement.version,
-                                  requirement.source_directory,
-                                  prefix=install_prefix, python=python)
-        install_binary_dist(members, prefix=install_prefix, python=python)
-    logger.info("Finished installing all requirements in %s.", install_timer)
-    return True
-
-def run_pip(arguments, use_remote_index, build_directory=None):
-    """
-    Execute a modified ``pip install`` command. This function assumes that the
-    arguments concern a ``pip install`` command (:py:func:`main()` makes sure
-    of this).
-
-    :param arguments: A list of strings containing the arguments that will be
-                      passed to ``pip``.
-    :param use_remote_index: A boolean indicating whether ``pip`` is allowed to
-                             contact http://pypi.python.org.
-    :returns: A ``RequirementSet`` object created by ``pip``, unless an
-              exception is raised by ``pip`` (in which case the exception will
-              bubble up).
-    """
-    command_line = []
-    for i, arg in enumerate(arguments):
-        if arg == 'install':
-            command_line += ['pip'] + arguments[:i+1] + [
-                    '--download-cache=%s' % download_cache,
-                    '--find-links=file://%s' % source_index]
-            if build_directory:
-                command_line += ['--build-directory=%s' % build_directory]
-            if not use_remote_index:
-                command_line += ['--no-index']
-            command_line += arguments[i+1:]
-            break
-    else:
-        command_line = ['pip'] + arguments
-    logger.info("Executing command: %s", ' '.join(command_line))
-    # XXX Nasty hack required for pip 1.4 compatibility (workaround for global state).
-    requirements_option.default = []
-    cmd_name, options, args, parser = parseopts(command_line[1:])
-    pip = CustomInstallCommand(parser)
-    exit_status = pip.main(args[1:], options)
-    # Make sure the output of pip and pip-accel are not intermingled.
-    sys.stdout.flush()
-    update_source_dists_index()
-    if exit_status == SUCCESS:
-        return pip.requirement_set
-    else:
-        raise pip.intercepted_exception
-
-class CustomInstallCommand(InstallCommand):
-
-    """
-    Subclass of :py:class:`pip.commands.install.InstallCommand` that makes it
-    easier to run ``pip install`` from Python. Used by the :py:func:`run_pip()`
-    function in order to run a ``pip install`` command in the same process,
-    without running pip as a subprocess.
-    """
-
-    def main(self, *args, **kw):
+    def install_requirements(self, requirements, **kw):
         """
-        ``pip.basecommand.Command.main()`` expects to be executed only once; it
-        unconditionally executes ``pip.log.logger.consumers.extend()``. This
-        means that when we run ``pip`` more than once we'll cause it to repeat
-        its output as many times as we executed a ``pip install`` command. We
-        wrap ``main()`` to explicitly reset the list of consumers.
+        Manually install a requirement set from binary and/or wheel distributions.
+
+        :param requirements: A list of :class:`pip_accel.req.Requirement` objects.
+        :param kw: Any keyword arguments are passed on to
+                   :func:`~pip_accel.bdist.BinaryDistributionManager.install_binary_dist()`.
+        :returns: The number of packages that were just installed (an integer).
         """
-        pip_logger.consumers = []
-        return super(CustomInstallCommand, self).main(*args, **kw)
+        install_timer = Timer()
+        install_types = []
+        if any(not req.is_wheel for req in requirements):
+            install_types.append('binary')
+        if any(req.is_wheel for req in requirements):
+            install_types.append('wheel')
+        logger.info("Installing from %s distributions ..", concatenate(install_types))
+        # Track installed files by default (unless the caller specifically opted out).
+        kw.setdefault('track_installed_files', True)
+        num_installed = 0
+        for requirement in requirements:
+            # If we're upgrading over an older version, first remove the
+            # old version to make sure we don't leave files from old
+            # versions around.
+            if is_installed(requirement.name):
+                uninstall(requirement.name)
+            # When installing setuptools we need to uninstall distribute,
+            # otherwise distribute will shadow setuptools and all sorts of
+            # strange issues can occur (e.g. upgrading to the latest
+            # setuptools to gain wheel support and then having everything
+            # blow up because distribute doesn't know about wheels).
+            if requirement.name == 'setuptools' and is_installed('distribute'):
+                uninstall('distribute')
+            if requirement.is_editable:
+                logger.debug("Installing %s in editable form using pip.", requirement)
+                command = InstallCommand()
+                opts, args = command.parse_args(['--no-deps', '--editable', requirement.source_directory])
+                command.run(opts, args)
+            elif requirement.is_wheel:
+                logger.info("Installing %s wheel distribution using pip ..", requirement)
+                wheel_version = pip_wheel_module.wheel_version(requirement.source_directory)
+                pip_wheel_module.check_compatibility(wheel_version, requirement.name)
+                requirement.pip_requirement.move_wheel_files(requirement.source_directory)
+            else:
+                binary_distribution = self.bdists.get_binary_dist(requirement)
+                self.bdists.install_binary_dist(binary_distribution, **kw)
+            num_installed += 1
+        logger.info("Finished installing %s in %s.",
+                    pluralize(num_installed, "requirement"),
+                    install_timer)
+        return num_installed
 
-
-    def run(self, *args, **kw):
+    def arguments_allow_wheels(self, arguments):
         """
-        The method ``pip.commands.install.InstallCommand.run()`` returns a
-        ``RequirementSet`` object which ``pip-accel`` is interested in, however
-        ``pip.basecommand.Command.main()`` (the caller of ``run()``) swallows
-        the requirement set (based on my reading of the pip 1.3.x source code).
-        We wrap ``run()`` so that we can intercept the requirement set. This is
-        a bit sneaky, but I don't fancy reimplementing large parts of
-        ``pip.basecommand.Command.main()`` inside ``pip-accel``!
+        Check whether the given command line arguments allow the use of wheels.
+
+        :param arguments: A list of strings with command line arguments.
+        :returns: :data:`True` if the arguments allow wheels, :data:`False` if
+                  they disallow wheels.
+
+        Contrary to what the name of this method implies its implementation
+        actually checks if the user hasn't *disallowed* the use of wheels using
+        the ``--no-use-wheel`` option (deprecated in pip 7.x) or the
+        ``--no-binary=:all:`` option (introduced in pip 7.x). This is because
+        wheels are "opt out" in recent versions of pip. I just didn't like the
+        method name ``arguments_dont_disallow_wheels`` ;-).
         """
-        original_method = super(CustomInstallCommand, self).run
-        try:
-            self.intercepted_exception = None
-            self.requirement_set = original_method(*args, **kw)
-            return self.requirement_set
-        except (Exception, KeyboardInterrupt), e:
-            self.intercepted_exception = e
-            raise
+        return not ('--no-use-wheel' in arguments or match_option_with_value(arguments, '--no-binary', ':all:'))
 
-def update_source_dists_index():
-    """
-    Link newly downloaded source distributions into the local index directory
-    using symbolic links.
-    """
-    link_timer = Timer()
-    for download_name in os.listdir(download_cache):
-        download_path = os.path.join(download_cache, download_name)
-        url = urllib.unquote(download_name)
-        if not url.endswith('.content-type'):
-            components = urlparse.urlparse(url)
-            archive_name = os.path.basename(components.path)
-            archive_path = os.path.join(source_index, add_extension(download_path, archive_name))
-            if not os.path.isfile(archive_path):
-                logger.debug("Linking files:")
-                logger.debug(" - Source: %s", download_path)
-                logger.debug(" - Target: %s", archive_path)
-                os.symlink(download_path, archive_path)
-    logger.debug("Updated source index links in %s.", link_timer)
+    def create_build_directory(self):
+        """Create a new build directory for pip to unpack its archives."""
+        self.build_directories.append(tempfile.mkdtemp(prefix='pip-accel-build-dir-'))
 
-def add_extension(download_path, archive_path):
-    """
-    Make sure all cached source distributions have the right file extension,
-    because not all distribution sites provide URLs with proper filenames in
-    them while we really need the proper filenames to build the local source
-    index.
+    def clear_build_directory(self):
+        """Clear the build directory where pip unpacks the source distribution archives."""
+        stat = os.stat(self.build_directory)
+        shutil.rmtree(self.build_directory)
+        os.makedirs(self.build_directory, stat.st_mode)
 
-    :param download_path: The pathname of the source distribution archive in
-                          the download cache.
-    :param archive_path: The pathname of the distribution archive in the source
-                         index directory.
-    :returns: The (possibly modified) pathname of the distribution archive in
-              the source index directory.
+    def cleanup_temporary_directories(self):
+        """Delete the build directories and any temporary directories created by pip."""
+        while self.build_directories:
+            shutil.rmtree(self.build_directories.pop())
+        for requirement in self.reported_requirements:
+            requirement.remove_temporary_source()
 
-    Previously this used the ``file`` executable, now it checks the magic file
-    headers itself. I could have used any of the numerous ``libmagic`` bindings
-    on PyPI, but that would add a binary dependency to ``pip-accel`` and I
-    don't want that :-).
-    """
-    handle = open(download_path)
-    header = handle.read(2)
-    handle.close()
-    if header.startswith('\x1f\x8b'):
-        # The gzip compression header is two bytes: 0x1F, 0x8B.
-        if not archive_path.endswith(('.tgz', '.tar.gz')):
-            archive_path += '.tar.gz'
-    elif header.startswith('BZ'):
-        # The bzip2 compression header is two bytes: B, Z.
-        if not archive_path.endswith('.bz2'):
-            archive_path += '.bz2'
-    elif header.startswith('PK'):
-        # According to Wikipedia, ZIP archives don't have an official magic
-        # number, but most of the time we'll find two bytes: P, K (for Phil
-        # Katz, creator of the format).
-        if not archive_path.endswith('.zip'):
-            archive_path += '.zip'
-    return archive_path
+    @property
+    def build_directory(self):
+        """Get the pathname of the current build directory (a string)."""
+        if not self.build_directories:
+            self.create_build_directory()
+        return self.build_directories[-1]
 
-def initialize_directories():
-    """
-    Create the directories for the download cache, the source index and the
-    binary index if any of them don't exist yet and reset the binary index
-    when its format changes.
-    """
-    # Create all required directories on the fly.
-    for directory in [download_cache, source_index, binary_index]:
-        if not os.path.isdir(directory):
-            os.makedirs(directory)
-    # When files are removed from pip's download cache, broken symbolic links
-    # remain in pip-accel's source index. This results in very confusing error
-    # messages. To avoid this we cleanup broken symbolic links.
-    for entry in sorted(os.listdir(source_index)):
-        pathname = os.path.join(source_index, entry)
-        if os.path.islink(pathname) and not os.path.exists(pathname):
-            logger.warn("Cleaning up broken symbolic link: %s", pathname)
-            os.unlink(pathname)
-    # If 1) pip's download cache is full but 2) pip-accel's source index hasn't
-    # been initialized yet and 3) all requirements are available in pip's
-    # download cache we can waste a lot of time. To avoid this we update the
-    # symbolic links in pip-accel's source index before every run.
-    update_source_dists_index()
-    # Invalidate the binary distribution cache when the
-    # format is changed in backwards incompatible ways.
-    if os.path.isfile(index_version_file):
-        with open(index_version_file) as handle:
-            if int(handle.read()) == CACHE_FORMAT_REVISION:
-                logger.debug("Binary distribution cache format is compatible.")
-                return
-    logger.debug("Binary distribution cache format is incompatible; clearing cache ..")
-    for entry in sorted(os.listdir(binary_index)):
-        pathname = os.path.join(binary_index, entry)
-        logger.debug(" - Deleting %s.", pathname)
-        os.unlink(pathname)
-    with open(index_version_file, 'w') as handle:
-        handle.write("%i\n" % CACHE_FORMAT_REVISION)
 
-ORIGINAL_PACKAGE_FINDER = None
+class DownloadLogFilter(logging.Filter):
 
-def install_custom_package_finder():
     """
-    Install :py:class:`CustomPackageFinder` so we can be sure that pip will not
-    try to fetch any index pages (i.e. we disable all crawling, which in my
-    experience is the slowest operation performed by pip).
-    """
-    global ORIGINAL_PACKAGE_FINDER
-    logger.debug("Installing custom package finder (to force --no-index behavior) ..")
-    ORIGINAL_PACKAGE_FINDER = pip_index_module.PackageFinder
-    pip_install_module.PackageFinder = CustomPackageFinder
+    Rewrite log messages emitted by pip's ``pip.download`` module.
 
-def cleanup_custom_package_finder():
+    When pip encounters hash mismatches it logs a message with the severity
+    :data:`~logging.CRITICAL`, however because of the interaction between
+    pip-accel and pip hash mismatches are to be expected and handled gracefully
+    (refer to :func:`~PipAccelerator.decorate_arguments()` for details). The
+    :class:`DownloadLogFilter` context manager changes the severity of these
+    log messages to :data:`~logging.DEBUG` in order to avoid confusing users of
+    pip-accel.
     """
-    Clean up the monkey patch applied by :py:func:`install_custom_package_finder()`.
-    Use a try/finally block to ensure that the monkey patch is removed as soon
-    as it's not needed anymore, because it will break pip's normal behavior!
-    """
-    logger.debug("Cleaning up custom package finder ..")
-    pip_install_module.PackageFinder = ORIGINAL_PACKAGE_FINDER
+
+    KEYWORDS = ("doesn't", "match", "expected", "hash")
+
+    def __enter__(self):
+        """Enable the download log filter."""
+        self.logger = logging.getLogger('pip.download')
+        self.logger.addFilter(self)
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        """Disable the download log filter."""
+        self.logger.removeFilter(self)
+
+    def filter(self, record):
+        """Change the severity of selected log records."""
+        if isinstance(record.msg, basestring):
+            message = record.msg.lower()
+            if all(kw in message for kw in self.KEYWORDS):
+                record.levelname = 'DEBUG'
+                record.levelno = logging.DEBUG
+        return 1
+
 
 class CustomPackageFinder(pip_index_module.PackageFinder):
 
     """
-    This class customizes :py:class:`pip.index.PackageFinder` to enforce what
+    Custom :class:`pip.index.PackageFinder` to keep pip off the internet.
+
+    This class customizes :class:`pip.index.PackageFinder` to enforce what
     the ``--no-index`` option does for the default package index but doesn't do
     for package indexes registered with the ``--index=`` option in requirements
     files. Judging by pip's documentation the fact that this has to be monkey
@@ -446,21 +673,115 @@ class CustomPackageFinder(pip_index_module.PackageFinder):
 
     @property
     def index_urls(self):
-        logger.debug("Custom package finder forcing --no-index behavior (hiding 'index_urls') ..")
+        """Dummy list of index URLs that is always empty."""
         return []
 
     @index_urls.setter
     def index_urls(self, value):
-        logger.debug("Custom package finder ignoring 'index_urls' value (%r) ..", value)
+        """Dummy setter for index URLs that ignores the value set."""
+        pass
 
     @property
     def dependency_links(self):
-        logger.debug("Custom package finder forcing --no-index behavior (hiding 'dependency_links') ..")
+        """Dummy list of dependency links that is always empty."""
         return []
 
     @dependency_links.setter
     def dependency_links(self, value):
-        logger.debug("Custom package finder ignoring 'dependency_links' value (%r) ..", value)
+        """Dummy setter for dependency links that ignores the value set."""
+        pass
 
-if __name__ == '__main__':
-    main()
+
+class PatchedAttribute(object):
+
+    """
+    Contact manager to temporarily patch an object attribute.
+
+    This context manager changes the value of an object attribute when the
+    context is entered and restores the original value when the context is
+    exited.
+    """
+
+    def __init__(self, object, attribute, value):
+        """
+        Initialize a :class:`PatchedAttribute` object.
+
+        :param object: The object whose attribute should be patched.
+        :param attribute: The name of the attribute to be patched (a string).
+        :param value: The temporary value for the attribute.
+        """
+        self.object = object
+        self.attribute = attribute
+        self.patched_value = value
+        self.original_value = None
+
+    def __enter__(self):
+        """Change the object attribute when entering the context."""
+        self.original_value = getattr(self.object, self.attribute)
+        setattr(self.object, self.attribute, self.patched_value)
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        """Restore the object attribute when leaving the context."""
+        setattr(self.object, self.attribute, self.original_value)
+
+
+class AttributeOverrides(object):
+
+    """
+    :class:`AttributeOverrides` enables overriding of object attributes.
+
+    During the pip 6.x upgrade pip-accel switched to using ``pip install
+    --download`` which unintentionally broke backwards compatibility with
+    previous versions of pip-accel as documented in `issue 52`_.
+
+    The reason for this is that when pip is given the ``--download`` option it
+    internally enables ``--ignore-installed`` (which can be problematic for
+    certain use cases as described in `issue 52`_). There is no documented way
+    to avoid this behavior, so instead pip-accel resorts to monkey patching to
+    restore backwards compatibility.
+
+    :class:`AttributeOverrides` is used to replace pip's parsed command line
+    options object with an object that defers all attribute access (gets and
+    sets) to the original options object but always reports
+    ``ignore_installed`` as :data:`False`, even after it was set to :data:`True` by pip
+    (as described above).
+
+    .. _issue 52: https://github.com/paylogic/pip-accel/issues/52
+    """
+
+    def __init__(self, opts, **overrides):
+        """
+        Construct an :class:`AttributeOverrides` instance.
+
+        :param opts: The object to which attribute access is deferred.
+        :param overrides: The attributes whose value should be overridden.
+        """
+        object.__setattr__(self, 'opts', opts)
+        object.__setattr__(self, 'overrides', overrides)
+
+    def __getattr__(self, name):
+        """
+        Get an attribute's value from overrides or by deferring attribute access.
+
+        :param name: The name of the attribute (a string).
+        :returns: The attribute's value.
+        """
+        if name in self.overrides:
+            logger.debug("AttributeOverrides() getting %s from overrides ..", name)
+            return self.overrides[name]
+        else:
+            logger.debug("AttributeOverrides() getting %s by deferring attribute access ..", name)
+            return getattr(self.opts, name)
+
+    def __setattr__(self, name, value):
+        """
+        Set an attribute's value (unless it has an override).
+
+        :param name: The name of the attribute (a string).
+        :param value: The new value for the attribute.
+        """
+        if name in self.overrides:
+            logger.debug("AttributeOverrides() refusing to set %s=%r (attribute has override) ..", name, value)
+        else:
+            logger.debug("AttributeOverrides() setting %s=%r by deferring attribute access ..", name, value)
+            setattr(self.opts, name, value)

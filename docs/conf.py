@@ -1,9 +1,14 @@
-# -*- coding: utf-8 -*-
+# Accelerator for pip, the Python package manager.
 #
-# pip-accel documentation build configuration file. This file is execfile()d
-# with the current directory set to its containing dir.
+# Author: Peter Odding <peter.odding@paylogic.com>
+# Last Change: November 14, 2015
+# URL: https://github.com/paylogic/pip-accel
 
-import sys, os
+"""Sphinx documentation configuration for the `pip-accel` project."""
+
+import os
+import sys
+import types
 
 # Add the pip_accel source distribution's root directory to the module path.
 sys.path.insert(0, os.path.abspath('..'))
@@ -11,7 +16,12 @@ sys.path.insert(0, os.path.abspath('..'))
 # -- General configuration -----------------------------------------------------
 
 # Sphinx extension module names.
-extensions = ['sphinx.ext.autodoc', 'sphinx.ext.intersphinx']
+extensions = [
+    'sphinx.ext.autodoc',
+    'sphinx.ext.graphviz',
+    'sphinx.ext.inheritance_diagram',
+    'sphinx.ext.intersphinx',
+]
 
 # Paths that contain templates, relative to this directory.
 templates_path = ['templates']
@@ -24,14 +34,14 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'pip-accel'
-copyright = u'2013, Peter Odding and Paylogic International'
+copyright = u'2015, Peter Odding and Paylogic International'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
 # built documents.
 
 # Find the package version and make it the release.
-from pip_accel import __version__ as pip_accel_version
+from pip_accel import __version__ as pip_accel_version  # NOQA
 
 # The short X.Y version.
 version = '.'.join(pip_accel_version.split('.')[:2])
@@ -50,12 +60,20 @@ exclude_patterns = ['build']
 # If true, '()' will be appended to :func: etc. cross-reference text.
 add_function_parentheses = True
 
+# http://sphinx-doc.org/ext/autodoc.html#confval-autodoc_member_order
+autodoc_member_order = 'bysource'
+
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
 
 # Refer to the Python standard library.
 # From: http://twistedmatrix.com/trac/ticket/4582.
-intersphinx_mapping = {'python': ('http://docs.python.org', None)}
+intersphinx_mapping = dict(
+    boto=('http://boto.readthedocs.org/en/latest/', None),
+    coloredlogs=('http://coloredlogs.readthedocs.org/en/latest/', None),
+    humanfriendly=('http://humanfriendly.readthedocs.org/en/latest/', None),
+    python=('http://docs.python.org', None),
+)
 
 # -- Options for HTML output ---------------------------------------------------
 
@@ -63,10 +81,24 @@ intersphinx_mapping = {'python': ('http://docs.python.org', None)}
 # a list of builtin themes.
 html_theme = 'default'
 
-# Add any paths that contain custom static files (such as style sheets) here,
-# relative to this directory. They are copied after the builtin static files,
-# so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['static']
-
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'pip-acceldoc'
+
+
+def setup(app):
+    """Sphinx customizations applied through the API."""
+    app.connect('autodoc-skip-member', custom_skip_member)
+
+
+def custom_skip_member(app, what, name, obj, skip, options):
+    """Inspired by http://stackoverflow.com/a/5599712/788200."""
+    if skip and obj.__doc__:
+        # If Sphinx would skip this object but it concerns a function or method
+        # that does have documentation we tell Sphinx to reconsider. This
+        # enables documentation of e.g. __init__(), __str__(), __unicode__(),
+        # __enter__(), __exit__(), etc. The isinstance() check makes sure we
+        # don't include things like __doc__, __module__ and __weakref__ in the
+        # documentation.
+        return not isinstance(obj, (types.FunctionType, types.MethodType))
+    else:
+        return skip
