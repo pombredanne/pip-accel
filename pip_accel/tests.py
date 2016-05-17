@@ -1,7 +1,7 @@
 # Tests for the pip accelerator.
 #
 # Author: Peter Odding <peter.odding@paylogic.com>
-# Last Change: November 11, 2015
+# Last Change: March 14, 2016
 # URL: https://github.com/paylogic/pip-accel
 
 """
@@ -25,6 +25,7 @@ have to do so retroactively.
 # Standard library modules.
 import fnmatch
 import glob
+import json
 import logging
 import operator
 import os
@@ -41,7 +42,7 @@ import unittest
 # External dependencies.
 import coloredlogs
 from cached_property import cached_property
-from humanfriendly import coerce_boolean, compact, concatenate
+from humanfriendly import coerce_boolean, compact, concatenate, dedent
 from pip.commands.install import InstallCommand
 from pip.exceptions import DistributionNotFound
 
@@ -53,10 +54,10 @@ from pip_accel.config import Config
 from pip_accel.deps import DependencyInstallationRefused, SystemPackageManager
 from pip_accel.exceptions import EnvironmentMismatchError
 from pip_accel.req import escape_name
-from pip_accel.utils import find_installed_version, uninstall
+from pip_accel.utils import create_file_url, makedirs, requirement_is_installed, uninstall
 
 # Test dependencies.
-from executor import CommandNotFound, which
+from executor import CommandNotFound, execute, which
 from executor.ssh.server import EphemeralTCPServer
 from portalocker import Lock
 
@@ -618,6 +619,112 @@ class PipAccelTestCase(unittest.TestCase):
         # this test and encounter an editable package.
         uninstall_through_subprocess('pep8')
 
+    def test_setup_requires_caching(self):
+        """
+        Test that :class:`pip_accel.SetupRequiresPatch` works as expected.
+
+        This test is a bit convoluted because I haven't been able to find a
+        simpler way to ensure that setup requirements can be re-used from the
+        ``.eggs`` directory managed by pip-accel. A side effect inside the
+        setup script seems to be required, but the setuptools sandbox forbids
+        writing to files outside the build directory so an external command
+        needs to be used ...
+        """
+        if not requirement_is_installed('setuptools >= 7.0'):
+            return self.skipTest("""
+                skipping setup requires caching test
+                (setuptools >= 7.0 isn't available)
+            """)
+        # Initialize pip-accel with an isolated working tree.
+        root = create_temporary_directory(prefix='pip-accel-', suffix='-setup-requires-test')
+        accelerator = self.initialize_pip_accel(data_directory=root)
+        # In this test we'll generate the following two Python packages.
+        setup_requires_provider = 'setup-requires-provider'
+        setup_requires_user = 'setup-requires-user'
+        # Create a data file to track setup script invocations.
+        tracker_datafile = os.path.join(root, 'setup-invocations.json')
+        with open(tracker_datafile, 'w') as handle:
+            json.dump({setup_requires_provider: {}, setup_requires_user: {}}, handle)
+        # Create a Python script to track setup script invocations.
+        tracker_script = os.path.join(root, 'setup-invocation-tracker')
+        with open(tracker_script, 'w') as handle:
+            handle.write(dedent('''
+                import json, sys
+                package_name = sys.argv[1]
+                command_name = next(a for a in sys.argv[2:] if not a.startswith('-'))
+                with open({filename}) as handle:
+                    invocations = json.load(handle)
+                counter = invocations[package_name].get(command_name, 0)
+                invocations[package_name][command_name] = counter + 1
+                with open({filename}, 'w') as handle:
+                    json.dump(invocations, handle)
+            ''', filename=repr(tracker_datafile)))
+        # Generate the package that provides a setup requirement.
+        self.generate_package(
+            name=setup_requires_provider,
+            version='1.0',
+            source_index=accelerator.config.source_index,
+            tracker_script=tracker_script,
+        )
+        # Generate the package that needs a setup requirement.
+        self.generate_package(
+            name=setup_requires_user,
+            version='1.0',
+            setup_requires=[setup_requires_provider],
+            find_links=accelerator.config.source_index,
+            source_index=accelerator.config.source_index,
+            tracker_script=tracker_script,
+        )
+        # Install the package that needs a setup requirement two times.
+        state = []
+        for i in 1, 2:
+            # Install the package that needs a setup requirement.
+            num_installed = accelerator.install_from_arguments(['--ignore-installed', setup_requires_user])
+            # Even though two packages are *involved*, only one should be *installed*.
+            assert num_installed == 1, "Expected pip-accel to install exactly one package!"
+            # Load the data file with setup invocations.
+            with open(tracker_datafile) as handle:
+                state.append(json.load(handle))
+        # Sanity check our invocation tracking machinery by making sure that
+        # the `egg_info' command of the package that needs a setup requirement
+        # was called once for each iteration.
+        assert state[0][setup_requires_user]['egg_info'] == 1
+        assert state[1][setup_requires_user]['egg_info'] == 2
+        # Also make sure the `bdist_dumb' command was called once in total.
+        assert state[1][setup_requires_user]['bdist_dumb'] == 1
+        # Now we can finally check what this whole test is about: The
+        # `bdist_egg' command (used for setup requirements) should only have
+        # been called on the first iteration because the second iteration was
+        # able to use the `.eggs' symbolic link.
+        assert state[0][setup_requires_provider]['bdist_egg'] == state[1][setup_requires_provider]['bdist_egg']
+
+    def generate_package(self, name, version, source_index, tracker_script, find_links=None, setup_requires=[]):
+        """Helper for :func:`test_setup_requires_caching()` to generate temporary Python packages."""
+        directory = create_temporary_directory(prefix='pip-accel-', suffix='-generated-package')
+        makedirs(directory)
+        with open(os.path.join(directory, 'setup.py'), 'w') as handle:
+            setup_params = [
+                'name=%r' % name,
+                'version=%r' % version,
+                'packages=find_packages()',
+            ]
+            if setup_requires:
+                setup_params.append('setup_requires=%r' % setup_requires)
+            handle.write(dedent('''
+                import subprocess, sys
+                subprocess.check_call([sys.executable, {script}, {package}] + sys.argv[1:])
+                from setuptools import setup, find_packages
+                setup({params})
+            ''', script=repr(tracker_script), package=repr(name), params=', '.join(setup_params)))
+        if find_links:
+            with open(os.path.join(directory, 'setup.cfg'), 'w') as handle:
+                handle.write(dedent('''
+                    [easy_install]
+                    allow_hosts = ''
+                    find_links = {file_url}/
+                ''', file_url=create_file_url(find_links)))
+        shutil.move(create_source_dist(directory), source_index)
+
     def test_time_based_cache_invalidation(self):
         """
         Test default cache invalidation logic (based on modification times).
@@ -644,12 +751,12 @@ class PipAccelTestCase(unittest.TestCase):
         """Test cache invalidation with the given option(s)."""
         if not self.pep8_git_repo:
             return self.skipTest("""
-                Skipping cache invalidation test (git clone of `pep8'
-                repository from GitHub seems to have failed).
+                skipping cache invalidation test (git clone of `pep8'
+                repository from github seems to have failed).
             """)
         accelerator = self.initialize_pip_accel(**overrides)
         # Install the pep8 package.
-        accelerator.install_from_arguments(['--ignore-installed', self.create_pep8_sdist()])
+        accelerator.install_from_arguments(['--ignore-installed', create_source_dist(self.pep8_git_repo)])
         # Find the modification time of the source and binary distributions.
         sdist_mtime_1 = os.path.getmtime(find_one_file(accelerator.config.source_index, '*pep8*'))
         bdist_mtime_1 = os.path.getmtime(find_one_file(accelerator.config.binary_cache, '*pep8*.tar.gz'))
@@ -657,7 +764,7 @@ class PipAccelTestCase(unittest.TestCase):
         # source distribution archive with different contents.
         with open(os.path.join(self.pep8_git_repo, 'MANIFEST.in'), 'w') as handle:
             handle.write("\n# An innocent comment to change the checksum ..\n")
-        accelerator.install_from_arguments(['--ignore-installed', self.create_pep8_sdist()])
+        accelerator.install_from_arguments(['--ignore-installed', create_source_dist(self.pep8_git_repo)])
         # Find the modification time of the source and binary distributions.
         sdist_mtime_2 = os.path.getmtime(find_one_file(accelerator.config.source_index, '*pep8*'))
         bdist_mtime_2 = os.path.getmtime(find_one_file(accelerator.config.binary_cache, '*pep8*.tar.gz'))
@@ -696,6 +803,54 @@ class PipAccelTestCase(unittest.TestCase):
             returncode = test_cli('pip-accel')
             assert returncode == 0, "pip-accel command line interface exited with nonzero return code!"
             assert 'Usage: pip-accel' in str(stream), "pip-accel command line interface didn't report usage message!"
+
+    def test_cli_as_module(self):
+        """Make sure ``python -m pip_accel ...`` works."""
+        if sys.version_info[:2] <= (2, 6):
+            return self.skipTest("""
+                Skipping 'python -m pip_accel ...' test because this feature
+                became supported on Python 2.7 while you are running an older
+                version.
+            """)
+        else:
+            output = execute(sys.executable, '-m', 'pip_accel', capture=True)
+            assert 'Usage: pip-accel' in output, "'python -m pip_accel' didn't report usage message!"
+
+    def test_constraint_file_support(self):
+        """
+        Test support for constraint files.
+
+        With the pip 7.x upgrade support for constraint files was added to pip.
+        Due to the way this was implemented in pip the use of constraint files
+        would break pip-accel as reported in `issue 63`_. The issue was since
+        fixed and this test makes sure constraint files remain supported.
+
+        .. _issue 63: https://github.com/paylogic/pip-accel/issues/63
+        """
+        # Make sure pep8 isn't already installed when this test starts.
+        uninstall_through_subprocess('pep8')
+        # Prepare a temporary constraints file.
+        constraint_file = os.path.join(create_temporary_directory(prefix='pip-accel-', suffix='-constraints-test'),
+                                       'constraints-file.txt')
+        with open(constraint_file, 'w') as handle:
+            # Constrain the version of the pep8 package.
+            handle.write('pep8==1.6.0\n')
+            # Include a constraint that is not a requirement. Before pip-accel
+            # version 0.37.1 this would raise an exception instead of being
+            # ignored.
+            handle.write('paver==1.2.4\n')
+        # Install pep8 based on the constraints file.
+        accelerator = self.initialize_pip_accel()
+        num_installed = accelerator.install_from_arguments([
+            '--ignore-installed',
+            '--no-binary=:all:',
+            '--constraint=%s' % constraint_file,
+            'pep8',
+        ])
+        assert num_installed == 1, "Expected pip-accel to install exactly one package!"
+        # Make sure the correct version was installed.
+        assert find_installed_version('pep8') == '1.6.0', \
+            "pip-accel failed to (properly) install pep8 version 1.6.0!"
 
     def test_empty_requirements_file(self):
         """
@@ -820,19 +975,6 @@ class PipAccelTestCase(unittest.TestCase):
         else:
             return None
 
-    def create_pep8_sdist(self):
-        """
-        Create a new source distribution archive in the `pep8` git checkout.
-
-        :returns: The pathname of the source distribution archive (a string)
-                  or :data:`None` if the checkout isn't available.
-        """
-        if self.pep8_git_repo:
-            distributions = os.path.join(self.pep8_git_repo, 'dist')
-            wipe_directory(distributions)
-            assert subprocess.call(['python', 'setup.py', 'sdist'], cwd=self.pep8_git_repo) == 0
-            return find_one_file(distributions, '*pep8*')
-
 
 def wipe_directory(pathname):
     """
@@ -845,21 +987,65 @@ def wipe_directory(pathname):
     os.makedirs(pathname)
 
 
+def create_source_dist(sources):
+    """
+    Create a source distribution archive from a Python package.
+
+    :param sources: A dictionary containing a ``setup.py`` script (a string).
+    :returns: The pathname of the generated archive (a string).
+    """
+    distributions_directory = os.path.join(sources, 'dist')
+    wipe_directory(distributions_directory)
+    assert subprocess.call(['python', 'setup.py', 'sdist'], cwd=sources) == 0
+    return find_one_file(distributions_directory, '*')
+
+
 def uninstall_through_subprocess(package_name):
     """
     Remove an installed Python package by running ``pip`` as a subprocess.
+
+    :param package_name: The name of the package (a string).
 
     This function is specifically for use in the pip-accel test suite to
     reliably uninstall a Python package installed in the current environment
     while avoiding issues caused by stale data in pip and the packages it uses
     internally. Doesn't complain if the package isn't installed to begin with.
+    """
+    while True:
+        returncode = subprocess.call([
+            find_python_program('pip'),
+            'uninstall', '--yes',
+            package_name,
+        ])
+        if returncode != 0:
+            break
+
+
+def find_installed_version(package_name, encoding='UTF-8'):
+    """
+    Find the version of an installed package (in a subprocess).
 
     :param package_name: The name of the package (a string).
+    :returns: The package's version (a string) or :data:`None` if the package can't
+              be found.
+
+    This function is specifically for use in the pip-accel test suite to
+    reliably determine the installed version of a Python package in the current
+    environment while avoiding issues caused by stale data in pip and the
+    packages it uses internally.
     """
-    subprocess.call([
-        find_python_program('pip'),
-        'uninstall', '--yes', package_name,
-    ])
+    interpreter = subprocess.Popen([sys.executable], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    snippet = dedent("""
+        import pkg_resources
+        for distribution in pkg_resources.working_set:
+            if distribution.key.lower() == {name}:
+                print(distribution.version)
+                break
+    """, name=repr(package_name.lower()))
+    stdout, stderr = interpreter.communicate(snippet.encode(encoding))
+    output = stdout.decode(encoding)
+    if output and not output.isspace():
+        return output.strip()
 
 
 def find_one_file(directory, pattern):

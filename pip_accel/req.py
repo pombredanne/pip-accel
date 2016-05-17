@@ -1,7 +1,7 @@
 # Accelerator for pip, the Python package manager.
 #
 # Author: Peter Odding <peter.odding@paylogic.com>
-# Last Change: November 7, 2015
+# Last Change: February 2, 2016
 # URL: https://github.com/paylogic/pip-accel
 
 """
@@ -28,6 +28,7 @@ basically undocumented AFAIK).
 
 # Standard library modules.
 import glob
+import logging
 import os
 import re
 import time
@@ -38,9 +39,19 @@ from pip_accel.utils import hash_files
 
 # External dependencies.
 from cached_property import cached_property
-from pip._vendor.distlib.util import ARCHIVE_EXTENSIONS
-from pip._vendor.pkg_resources import find_distributions
 from pip.req import InstallRequirement
+
+# The following package(s) are usually bundled with pip but may be unbundled
+# by redistributors and pip-accel should handle this gracefully.
+try:
+    from pip._vendor.distlib.util import ARCHIVE_EXTENSIONS
+    from pip._vendor.pkg_resources import find_distributions
+except ImportError:
+    from distlib.util import ARCHIVE_EXTENSIONS
+    from pkg_resources import find_distributions
+
+# Initialize a logger for this module.
+logger = logging.getLogger(__name__)
 
 
 class Requirement(object):
@@ -236,6 +247,44 @@ class Requirement(object):
     def __str__(self):
         """Render a human friendly string describing the requirement."""
         return "%s (%s)" % (self.name, self.version)
+
+
+class TransactionalUpdate(object):
+
+    """Context manager that enables transactional package upgrades."""
+
+    def __init__(self, requirement):
+        """
+        Initialize a :class:`TransactionalUpdate` object.
+
+        :param requirement: A :class:`Requirement` object.
+        """
+        self.requirement = requirement
+        self.pip_requirement = requirement.pip_requirement
+        self.in_transaction = False
+
+    def __enter__(self):
+        """Prepare package upgrades by removing conflicting installations."""
+        if self.pip_requirement.conflicts_with:
+            # Let __exit__() know that it should commit or rollback.
+            self.in_transaction = True
+            # Remove the conflicting installation (and let the user know).
+            logger.info("Found existing installation: %s", self.pip_requirement.conflicts_with)
+            self.pip_requirement.uninstall(auto_confirm=True)
+            # The uninstall() method has the unfortunate side effect of setting
+            # `satisfied_by' (as a side effect of calling check_if_exists())
+            # which breaks the behavior we expect from pkg_info(). We clear the
+            # `satisfied_by' property to avoid this strange interaction.
+            self.pip_requirement.satisfied_by = None
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        """Finalize or rollback a package upgrade."""
+        if self.in_transaction:
+            if exc_type is None:
+                self.pip_requirement.commit_uninstall()
+            else:
+                self.pip_requirement.rollback_uninstall()
+            self.in_transaction = False
 
 
 def escape_name(requirement_name):

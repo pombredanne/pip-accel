@@ -1,7 +1,7 @@
 # Accelerator for pip, the Python package manager.
 #
 # Author: Peter Odding <peter.odding@paylogic.com>
-# Last Change: November 14, 2015
+# Last Change: March 14, 2016
 # URL: https://github.com/paylogic/pip-accel
 #
 # TODO Permanently store logs in the pip-accel directory (think about log rotation).
@@ -54,7 +54,7 @@ import tempfile
 from pip_accel.bdist import BinaryDistributionManager
 from pip_accel.compat import basestring
 from pip_accel.exceptions import EnvironmentMismatchError, NothingToDoError
-from pip_accel.req import Requirement
+from pip_accel.req import Requirement, TransactionalUpdate
 from pip_accel.utils import (
     create_file_url,
     hash_files,
@@ -62,6 +62,7 @@ from pip_accel.utils import (
     makedirs,
     match_option,
     match_option_with_value,
+    requirement_is_installed,
     same_directories,
     uninstall,
 )
@@ -70,13 +71,13 @@ from pip_accel.utils import (
 from humanfriendly import concatenate, Timer, pluralize
 from pip import index as pip_index_module
 from pip import wheel as pip_wheel_module
-from pip._vendor import pkg_resources
 from pip.commands import install as pip_install_module
 from pip.commands.install import InstallCommand
 from pip.exceptions import DistributionNotFound
+from pip.req import InstallRequirement
 
 # Semi-standard module versioning.
-__version__ = '0.37'
+__version__ = '0.43'
 
 # Initialize a logger for this module.
 logger = logging.getLogger(__name__)
@@ -114,6 +115,8 @@ class PipAccelerator(object):
         # We hold on to returned Requirement objects so we can remove their
         # temporary sources after pip-accel has finished.
         self.reported_requirements = []
+        # Keep a list of `.eggs' symbolic links created by pip-accel.
+        self.eggs_links = []
 
     def validate_environment(self):
         """
@@ -141,8 +144,9 @@ class PipAccelerator(object):
                 """, environment=environment, prefix=sys.prefix)
 
     def initialize_directories(self):
-        """Automatically create the local source distribution index directory."""
+        """Automatically create local directories required by pip-accel."""
         makedirs(self.config.source_index)
+        makedirs(self.config.eggs_cache)
 
     def clean_source_index(self):
         """
@@ -236,6 +240,9 @@ class PipAccelerator(object):
                 logger.info("Preparing to upgrade to setuptools >= 0.8 to enable wheel support ..")
                 requirements.extend(self.get_requirements(['setuptools >= 0.8']))
             if requirements:
+                if '--user' in arguments:
+                    from site import USER_BASE
+                    kw.setdefault('prefix', USER_BASE)
                 return self.install_requirements(requirements, **kw)
             else:
                 logger.info("Nothing to do! (requirements already installed)")
@@ -247,20 +254,10 @@ class PipAccelerator(object):
         """
         Check whether setuptools should be upgraded to ``>= 0.8`` for wheel support.
 
-        :returns: :data:`True` when setuptools needs to be upgraded, :data:`False` otherwise.
+        :returns: :data:`True` when setuptools 0.8 or higher is already
+                  installed, :data:`False` otherwise (it needs to be upgraded).
         """
-        # Don't use pkg_resources.Requirement.parse, to avoid the override
-        # in distribute, that converts `setuptools' to `distribute'.
-        setuptools_requirement = next(pkg_resources.parse_requirements('setuptools >= 0.8'))
-        try:
-            installed_setuptools = pkg_resources.get_distribution('setuptools')
-            if installed_setuptools in setuptools_requirement:
-                # setuptools >= 0.8 is already installed; nothing to do.
-                return True
-        except pkg_resources.DistributionNotFound:
-            pass
-        # We need to install setuptools >= 0.8.
-        return False
+        return requirement_is_installed('setuptools >= 0.8')
 
     def get_requirements(self, arguments, max_retries=None, use_wheels=False):
         """
@@ -282,43 +279,46 @@ class PipAccelerator(object):
                      pip's ``--ignore-installed`` option.
         """
         arguments = self.decorate_arguments(arguments)
+        # Demote hash sum mismatch log messages from CRITICAL to DEBUG (hiding
+        # implementation details from users unless they want to see them).
         with DownloadLogFilter():
-            # Use a new build directory for each run of get_requirements().
-            self.create_build_directory()
-            # Check whether -U or --upgrade was given.
-            if any(match_option(a, '-U', '--upgrade') for a in arguments):
-                logger.info("Checking index(es) for new version (-U or --upgrade was given) ..")
-            else:
-                # If -U or --upgrade wasn't given and all requirements can be
-                # satisfied using the archives in pip-accel's local source
-                # index we don't need pip to connect to PyPI looking for new
-                # versions (that will just slow us down).
-                try:
-                    return self.unpack_source_dists(arguments, use_wheels=use_wheels)
-                except DistributionNotFound:
-                    logger.info("We don't have all distribution archives yet!")
-            # Get the maximum number of retries from the configuration if the
-            # caller didn't specify a preference.
-            if max_retries is None:
-                max_retries = self.config.max_retries
-            # If not all requirements are available locally we use pip to
-            # download the missing source distribution archives from PyPI (we
-            # retry a couple of times in case pip reports recoverable
-            # errors).
-            for i in range(max_retries):
-                try:
-                    return self.download_source_dists(arguments, use_wheels=use_wheels)
-                except Exception as e:
-                    if i + 1 < max_retries:
-                        # On all but the last iteration we swallow exceptions
-                        # during downloading.
-                        logger.warning("pip raised exception while downloading distributions: %s", e)
-                    else:
-                        # On the last iteration we don't swallow exceptions
-                        # during downloading because the error reported by pip
-                        # is the most sensible error for us to report.
-                        raise
-                logger.info("Retrying after pip failed (%i/%i) ..", i + 1, max_retries)
+            with SetupRequiresPatch(self.config, self.eggs_links):
+                # Use a new build directory for each run of get_requirements().
+                self.create_build_directory()
+                # Check whether -U or --upgrade was given.
+                if any(match_option(a, '-U', '--upgrade') for a in arguments):
+                    logger.info("Checking index(es) for new version (-U or --upgrade was given) ..")
+                else:
+                    # If -U or --upgrade wasn't given and all requirements can be
+                    # satisfied using the archives in pip-accel's local source
+                    # index we don't need pip to connect to PyPI looking for new
+                    # versions (that will just slow us down).
+                    try:
+                        return self.unpack_source_dists(arguments, use_wheels=use_wheels)
+                    except DistributionNotFound:
+                        logger.info("We don't have all distribution archives yet!")
+                # Get the maximum number of retries from the configuration if the
+                # caller didn't specify a preference.
+                if max_retries is None:
+                    max_retries = self.config.max_retries
+                # If not all requirements are available locally we use pip to
+                # download the missing source distribution archives from PyPI (we
+                # retry a couple of times in case pip reports recoverable
+                # errors).
+                for i in range(max_retries):
+                    try:
+                        return self.download_source_dists(arguments, use_wheels=use_wheels)
+                    except Exception as e:
+                        if i + 1 < max_retries:
+                            # On all but the last iteration we swallow exceptions
+                            # during downloading.
+                            logger.warning("pip raised exception while downloading distributions: %s", e)
+                        else:
+                            # On the last iteration we don't swallow exceptions
+                            # during downloading because the error reported by pip
+                            # is the most sensible error for us to report.
+                            raise
+                    logger.info("Retrying after pip failed (%i/%i) ..", i + 1, max_retries)
 
     def decorate_arguments(self, arguments):
         """
@@ -525,9 +525,16 @@ class PipAccelerator(object):
             # is not used. We filter out these requirements because pip never
             # unpacks distributions for these requirements, so pip-accel can't
             # do anything useful with such requirements.
-            if not requirement.satisfied_by:
-                filtered_requirements.append(requirement)
-                self.reported_requirements.append(requirement)
+            if requirement.satisfied_by:
+                continue
+            # The `constraint' property marks requirement objects that
+            # constrain the acceptable version(s) of another requirement but
+            # don't define a requirement themselves, so we filter them out.
+            if requirement.constraint:
+                continue
+            # All other requirements are reported to callers.
+            filtered_requirements.append(requirement)
+            self.reported_requirements.append(requirement)
         return sorted([Requirement(self.config, r) for r in filtered_requirements],
                       key=lambda r: r.name.lower())
 
@@ -551,11 +558,6 @@ class PipAccelerator(object):
         kw.setdefault('track_installed_files', True)
         num_installed = 0
         for requirement in requirements:
-            # If we're upgrading over an older version, first remove the
-            # old version to make sure we don't leave files from old
-            # versions around.
-            if is_installed(requirement.name):
-                uninstall(requirement.name)
             # When installing setuptools we need to uninstall distribute,
             # otherwise distribute will shadow setuptools and all sorts of
             # strange issues can occur (e.g. upgrading to the latest
@@ -565,17 +567,21 @@ class PipAccelerator(object):
                 uninstall('distribute')
             if requirement.is_editable:
                 logger.debug("Installing %s in editable form using pip.", requirement)
-                command = InstallCommand()
-                opts, args = command.parse_args(['--no-deps', '--editable', requirement.source_directory])
-                command.run(opts, args)
+                with TransactionalUpdate(requirement):
+                    command = InstallCommand()
+                    opts, args = command.parse_args(['--no-deps', '--editable', requirement.source_directory])
+                    command.run(opts, args)
             elif requirement.is_wheel:
                 logger.info("Installing %s wheel distribution using pip ..", requirement)
-                wheel_version = pip_wheel_module.wheel_version(requirement.source_directory)
-                pip_wheel_module.check_compatibility(wheel_version, requirement.name)
-                requirement.pip_requirement.move_wheel_files(requirement.source_directory)
+                with TransactionalUpdate(requirement):
+                    wheel_version = pip_wheel_module.wheel_version(requirement.source_directory)
+                    pip_wheel_module.check_compatibility(wheel_version, requirement.name)
+                    requirement.pip_requirement.move_wheel_files(requirement.source_directory)
             else:
-                binary_distribution = self.bdists.get_binary_dist(requirement)
-                self.bdists.install_binary_dist(binary_distribution, **kw)
+                logger.info("Installing %s binary distribution using pip-accel ..", requirement)
+                with TransactionalUpdate(requirement):
+                    binary_distribution = self.bdists.get_binary_dist(requirement)
+                    self.bdists.install_binary_dist(binary_distribution, **kw)
             num_installed += 1
         logger.info("Finished installing %s in %s.",
                     pluralize(num_installed, "requirement"),
@@ -615,6 +621,10 @@ class PipAccelerator(object):
             shutil.rmtree(self.build_directories.pop())
         for requirement in self.reported_requirements:
             requirement.remove_temporary_source()
+        while self.eggs_links:
+            symbolic_link = self.eggs_links.pop()
+            if os.path.islink(symbolic_link):
+                os.unlink(symbolic_link)
 
     @property
     def build_directory(self):
@@ -659,6 +669,75 @@ class DownloadLogFilter(logging.Filter):
         return 1
 
 
+class SetupRequiresPatch(object):
+
+    """
+    Monkey patch to enable caching of setup requirements.
+
+    This context manager monkey patches ``InstallRequirement.run_egg_info()``
+    to enable caching of setup requirements. It works by creating a symbolic
+    link called ``.eggs`` in the source directory of unpacked Python source
+    distributions which points to a shared directory inside the pip-accel
+    data directory. This can only work on platforms that support
+    :func:`os.symlink()`` but should fail gracefully elsewhere.
+
+    The :class:`SetupRequiresPatch` context manager doesn't clean up the
+    symbolic links because doing so would remove the link when it is still
+    being used. Instead the context manager builds up a list of created links
+    so that pip-accel can clean these up when it is known that the symbolic
+    links are no longer needed.
+
+    For more information about this hack please refer to `issue 49
+    <https://github.com/paylogic/pip-accel/issues/49>`_.
+    """
+
+    def __init__(self, config, created_links=None):
+        """
+        Initialize a :class:`SetupRequiresPatch` object.
+
+        :param config: A :class:`~pip_accel.config.Config` object.
+        :param created_links: A list where newly created symbolic links are
+                              added to (so they can be cleaned up later).
+        """
+        self.config = config
+        self.patch = None
+        self.created_links = created_links
+
+    def __enter__(self):
+        """Enable caching of setup requirements (by patching the ``run_egg_info()`` method)."""
+        if self.patch is None:
+            created_links = self.created_links
+            original_method = InstallRequirement.run_egg_info
+            shared_directory = self.config.eggs_cache
+
+            def run_egg_info_wrapper(self, *args, **kw):
+                # Heads up: self is an `InstallRequirement' object here!
+                link_name = os.path.join(self.source_dir, '.eggs')
+                try:
+                    logger.debug("Creating symbolic link: %s -> %s", link_name, shared_directory)
+                    os.symlink(shared_directory, link_name)
+                    if created_links is not None:
+                        created_links.append(link_name)
+                except Exception as e:
+                    # Always log the failure, but only include a traceback if
+                    # it looks like symbolic links should be supported on the
+                    # current platform (os.symlink() is available).
+                    logger.debug("Failed to create symbolic link! (continuing without)",
+                                 exc_info=not isinstance(e, AttributeError))
+                # Execute the real run_egg_info() method.
+                return original_method(self, *args, **kw)
+
+            # Install the wrapper method for the duration of the context manager.
+            self.patch = PatchedAttribute(InstallRequirement, 'run_egg_info', run_egg_info_wrapper)
+            self.patch.__enter__()
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        """Undo the changes that enable caching of setup requirements."""
+        if self.patch is not None:
+            self.patch.__exit__(exc_type, exc_value, traceback)
+            self.patch = None
+
+
 class CustomPackageFinder(pip_index_module.PackageFinder):
 
     """
@@ -695,34 +774,41 @@ class CustomPackageFinder(pip_index_module.PackageFinder):
 class PatchedAttribute(object):
 
     """
-    Contact manager to temporarily patch an object attribute.
+    Context manager to temporarily patch an object attribute.
 
     This context manager changes the value of an object attribute when the
     context is entered and restores the original value when the context is
     exited.
     """
 
-    def __init__(self, object, attribute, value):
+    def __init__(self, object, attribute, value, enabled=True):
         """
         Initialize a :class:`PatchedAttribute` object.
 
         :param object: The object whose attribute should be patched.
         :param attribute: The name of the attribute to be patched (a string).
         :param value: The temporary value for the attribute.
+        :param enabled: :data:`True` to patch the attribute, :data:`False` to
+                        do nothing instead. This enables conditional attribute
+                        patching while unconditionally using the
+                        :keyword:`with` statement.
         """
         self.object = object
         self.attribute = attribute
         self.patched_value = value
         self.original_value = None
+        self.enabled = enabled
 
     def __enter__(self):
         """Change the object attribute when entering the context."""
-        self.original_value = getattr(self.object, self.attribute)
-        setattr(self.object, self.attribute, self.patched_value)
+        if self.enabled:
+            self.original_value = getattr(self.object, self.attribute)
+            setattr(self.object, self.attribute, self.patched_value)
 
     def __exit__(self, exc_type=None, exc_value=None, traceback=None):
         """Restore the object attribute when leaving the context."""
-        setattr(self.object, self.attribute, self.original_value)
+        if self.enabled:
+            setattr(self.object, self.attribute, self.original_value)
 
 
 class AttributeOverrides(object):

@@ -68,6 +68,13 @@ example:
 
    $ pip-accel install -r requirements.txt
 
+Alternatively you can also run pip-accel as follows, but note that this
+requires Python 2.7 or higher (it specifically doesn't work on Python 2.6):
+
+.. code-block:: bash
+
+   $ python -m pip_accel install -r requirements.txt
+
 If you pass a ``-v`` or ``--verbose`` option then pip and pip-accel will both
 use verbose output. The ``-q`` or ``--quiet`` option is also supported.
 
@@ -187,6 +194,21 @@ point pip-accel at the FakeS3 server (in order to test the Amazon S3 cache
 backend without actually having to pay for an Amazon S3 bucket :-). For more
 details please refer to the documentation of the `Amazon S3 cache backend`_.
 
+Caching of setup requirements
+-----------------------------
+
+Since version 0.38 pip-accel instructs setuptools to cache setup requirements
+in a subdirectory of pip-accel's data directory (see the eggs_cache_ option) to
+avoid recompilation of setup requirements. This works by injecting a symbolic
+link called ``.eggs`` into unpacked source distribution directories before pip
+or pip-accel runs the setup script.
+
+The use of the ``.eggs`` directory was added in setuptools version 7.0 which is
+why pip-accel now requires setuptools 7.0 or higher to be installed. This
+dependency was added because the whole point of pip-accel is to work well out
+of the box, shielding the user from surprising behavior like setup requirements
+slowing things down and breaking offline installation.
+
 Dependencies on system packages
 -------------------------------
 
@@ -296,7 +318,7 @@ License
 This software is licensed under the `MIT license`_ just like pip_ (on which
 pip-accel is based).
 
-© 2015 Peter Odding and Paylogic_ International.
+© 2016 Peter Odding and Paylogic_ International.
 
 
 .. External references:
@@ -308,6 +330,7 @@ pip-accel is based).
 .. _Binary distributions: http://docs.python.org/2/distutils/builtdist.html
 .. _Boto: https://github.com/boto/boto
 .. _documentation of the pip_accel.config module: http://pip-accel.readthedocs.org/en/latest/developers.html#module-pip_accel.config
+.. _eggs_cache: http://pip-accel.readthedocs.org/en/latest/developers.html#pip_accel.config.Config.binary_cache
 .. _FakeS3: https://github.com/jubos/fake-s3
 .. _GitHub project page: https://github.com/paylogic/pip-accel
 .. _hosted on Read The Docs: https://pip-accel.readthedocs.org/

@@ -3,7 +3,7 @@
 # Shell script to initialize a pip-accel test environment.
 #
 # Author: Peter Odding <peter.odding@paylogic.com>
-# Last Change: November 10, 2015
+# Last Change: March 14, 2016
 # URL: https://github.com/paylogic/pip-accel
 #
 # This shell script is used in tox.ini and .travis.yml to prepare
@@ -30,10 +30,6 @@ main () {
   # Make it possible to install local working copies of selected dependencies.
   install_working_copies
 
-  # Downgrade setuptools so the test suite can verify that setuptools
-  # is upgraded to >= 0.8 when a binary wheel is installed.
-  downgrade_setuptools
-
   # Install requests==2.6.0 so the test suite can downgrade to requests==2.2.1
   # (to verify that downgrading of packages works).
   install_requests
@@ -52,25 +48,22 @@ install_working_copies () {
     for PROJECT in coloredlogs executor humanfriendly; do
       DIRECTORY="$HOME/projects/python/$PROJECT"
       if [ -e "$DIRECTORY" ]; then
-        msg "Installing working copy of $PROJECT .."
-        pip install --quiet "$DIRECTORY"
+        if flock -x "$DIRECTORY"; then
+          msg "Installing working copy of $PROJECT .."
+          # The following code to install a Python package from a git checkout is
+          # a bit convoluted because I want to bypass pip's frustrating "let's
+          # copy the whole project tree including a 100 MB `.tox' directory
+          # before installing 10 KB of source code" approach. The use of a
+          # source distribution works fine :-).
+          cd "$DIRECTORY"
+          rm -Rf dist
+          python setup.py sdist &>/dev/null
+          # Side step caching of binary wheels because we'll be building a new
+          # one on each run anyway.
+          pip install --no-binary=:all: --quiet dist/*
+        fi
       fi
     done
-  fi
-}
-
-downgrade_setuptools () {
-  # FWIW: Performing this downgrade inside the test suite's Python process
-  # doesn't work as expected because pip (pkg_resources) will still think the
-  # newer version is installed (due to caching without proper cache
-  # invalidation by pkg_resources).
-  if python -c 'import sys; sys.exit(0 if sys.version_info[0] == 2 else 1)'; then
-    # The downgrade of setuptools fails on Travis CI Python 3.x builds, but as
-    # long as the test suite runs the automatic upgrade at least once (on
-    # Python 2.6 and/or Python 2.7) I'm happy :-).
-    msg "Downgrading setuptools (so the test suite can upgrade it) .."
-    # FYI: Binary wheels disabled to reduce test suite noise.
-    pip install --quiet --no-binary=:all: 'setuptools >= 0.7.8, < 0.8'
   fi
 }
 
